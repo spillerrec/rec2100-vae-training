@@ -5,6 +5,100 @@
 #include <memory>
 
 #include <png++/png.hpp>
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <memory>
+#include <png.h>
+#include <cstdint>
+#include <optional>
+
+#include <exiv2/exiv2.hpp>
+
+struct PngCleanup {
+	png_structp png = nullptr;
+	png_infop info = nullptr;
+	
+	~PngCleanup() {
+		if (info)
+			png_destroy_info_struct(png, &info);
+		if (png)
+			png_destroy_read_struct(&png, nullptr, nullptr);
+	}
+};
+
+struct FileDeleter {
+	void operator()(FILE* fp) const { if (fp) fclose(fp); }
+};
+
+std::optional<std::string> ReadParametersFromPNG(const char* filename) {
+	auto Error = [](auto msg){
+		std::cerr << "PNG parameters error: " << msg << std::endl;
+		return std::optional<std::string>();
+	};
+	std::unique_ptr<FILE, FileDeleter> fp(fopen(filename, "rb"));
+	if (!fp)
+		return Error("Unable to open file");
+
+	unsigned char header[8];
+	fread(header, 1, 8, fp.get());
+	if (png_sig_cmp(header, 0, 8))
+		return Error("Not a PNG file.");
+
+	PngCleanup png;
+	png.png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+	if (!png.png)
+		return Error("Failed to create PNG read struct.");
+
+	png.info = png_create_info_struct(png.png);
+	if (!png.info)
+		return Error("Failed to create PNG info struct.");
+
+	if (setjmp(png_jmpbuf(png.png)))
+		return Error("Failed to setjmp for PNG error handling.");
+
+	png_init_io(png.png, fp.get());
+	png_set_sig_bytes(png.png, 8);
+	png_read_info(png.png, png.info);
+
+	std::cout << "Reading PNG chunks from: " << filename << std::endl;
+
+	png_textp text_ptr;
+	int num_text;
+	if (png_get_text(png.png, png.info, &text_ptr, &num_text) > 0) {
+		for (int i = 0; i < num_text; ++i)
+			  if (text_ptr[i].key == std::string("parameters"))
+				return std::string(reinterpret_cast<char*>(text_ptr[i].text), text_ptr[i].text_length);
+	}
+	
+	return {};
+}
+
+
+
+std::vector<uint8_t> createExifWithComment(const std::string& comment) {
+	Exiv2::Blob exifBuffer;
+	Exiv2::ExifData exifData;
+	 
+	Exiv2::Value::AutoPtr v = Exiv2::Value::create(Exiv2::asciiString);
+	v->read(comment);
+	Exiv2::ExifKey key("Exif.Photo.UserComment");
+	exifData.add(key, v.get());
+
+	Exiv2::ExifParser parser;
+	parser.encode(exifBuffer, Exiv2::littleEndian, exifData);
+	 
+	 
+	//std::unique_ptr<FILE, FileDeleter> fp(fopen("meta.exif", "wb"));
+	 //fwrite(exifBuffer.data(), exifBuffer.size(), 1, fp.get());
+	 
+	 std::vector<uint8_t> header = {0x45, 0x78, 0x69, 0x66, 0x00, 0x00};
+	 exifBuffer.insert(exifBuffer.begin(), header.begin(), header.end());
+
+	return std::vector<uint8_t>(exifBuffer.data(), exifBuffer.data() + exifBuffer.size());
+}
+
+
 
 int main(int argc, char * argv[])
 {
@@ -15,6 +109,8 @@ int main(int argc, char * argv[])
 
 	const char * inputFilename = argv[1];
 	const char * outputFilename = argv[2];
+	
+	auto parameters = ReadParametersFromPNG(inputFilename);
 
 	png::image< png::rgb_pixel > inImg(inputFilename);
 
@@ -69,6 +165,20 @@ int main(int argc, char * argv[])
 	}
 	std::cout << "set raw end\n";
 	
+	uhdr_mem_block block;
+	std::vector<uint8_t> exif;
+	if (parameters){
+		std::cout << "Writing parameters" << std::endl;
+		std::cout << *parameters << std::endl;
+		exif = createExifWithComment(*parameters);
+		block.data = exif.data();
+		
+		block.data_sz = block.capacity = exif.size();
+		auto exif_result = uhdr_enc_set_exif_data(encoder, &block);
+		if (exif_result.error_code != UHDR_CODEC_OK)
+			std::cout << exif_result.detail;
+	}
+	
 	std::cout << "Start encode\n";
 	auto encode_result = uhdr_encode(encoder);
 	if (encode_result.error_code != UHDR_CODEC_OK)
@@ -90,24 +200,6 @@ int main(int argc, char * argv[])
 	FILE * f = fopen(outputFilename, "wb");
 	size_t bytesWritten = fwrite(compressed->data, 1, compressed->data_sz, f);
 	fclose(f);
-	
-	
-	
-
-/*
-        // Fill your RGB(A) data here
-        memset(rgb.pixels, 255, rgb.rowBytes * image->height);
-		  int w = inImg.get_width();
-		  int h = inImg.get_height();
-		  for (int iy=0; iy<h; iy++)
-			  for (int ix=0; ix<w; ix++)
-			  {
-				  auto p = rgb.pixels + rgb.rowBytes * iy + ix*4;
-				  p[0] = inImg[iy][ix].red;
-				  p[1] = inImg[iy][ix].green;
-				  p[2] = inImg[iy][ix].blue;
-			  }
-*/
 
 	uhdr_release_encoder(encoder);
 	return 0;
