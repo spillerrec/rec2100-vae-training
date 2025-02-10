@@ -11,9 +11,12 @@
 #include <memory>
 #include <png.h>
 #include <cstdint>
+#include <cmath>
 #include <optional>
 
 #include <exiv2/exiv2.hpp>
+
+#include "half_float/umHalf.h"
 
 struct PngCleanup {
 	png_structp png = nullptr;
@@ -98,7 +101,18 @@ std::vector<uint8_t> createExifWithComment(const std::string& comment) {
 	return std::vector<uint8_t>(exifBuffer.data(), exifBuffer.data() + exifBuffer.size());
 }
 
+double pq_to_linear(double pq)
+{
+	double c1 = 0.8359;
+	double c2 = 18.8516;
+	double c3 = 18.6875;
+	double m = 0.1593;
+	double n = 78.8438;
 
+	pq = std::clamp(pq, 0.0, 1.0);
+	double L = (std::pow(std::max(pq, 0.0), (1.0 / n)) - c1) / (c2 - c3 * (std::pow(std::max(pq, 0.0), (1.0 / n))));
+	return std::pow(std::clamp(L, 0.0, 1.0), (1.0 / m)) / 203 * 10000;
+}
 
 int main(int argc, char * argv[])
 {
@@ -117,15 +131,15 @@ int main(int argc, char * argv[])
 	uhdr_codec_private_t* encoder = uhdr_create_encoder();
 
 	uhdr_raw_image_t img;
-	img.fmt = UHDR_IMG_FMT_32bppRGBA1010102;
+	img.fmt = UHDR_IMG_FMT_64bppRGBAHalfFloat;
 	img.cg = UHDR_CG_BT_2100;
-	img.ct = UHDR_CT_PQ;
+	img.ct = UHDR_CT_LINEAR;
 	img.range = UHDR_CR_FULL_RANGE;
 
 	img.w = inImg.get_width();
 	img.h = inImg.get_height();
 
-	auto buffer = std::make_unique<uint8_t[]>( img.w*img.h*4 );
+	auto buffer = std::make_unique<half[]>( img.w*img.h*4 );
 
 	img.planes[0] = buffer.get();
 	img.planes[1] = nullptr;
@@ -143,13 +157,9 @@ int main(int argc, char * argv[])
 			auto p = buffer.get() + w * iy * 4 + ix * 4;
 			
 			auto pix = inImg[iy][ix];
-			uint16_t r = (pix.red   << 2) + 4;//(pix.red >> 6);
-			uint16_t g = (pix.green << 2) + 4;//(pix.green >> 6);
-			uint16_t b = (pix.blue  << 2) + 4;//(pix.blue >> 6);
-			p[0] = (r << 0) & 0xFF;
-			p[1] = (r >> 8) + (g << 2) & 0xFF;
-			p[2] = (g >> 6) + (b << 2) & 0xFF;
-			p[3] = (b >> 4);
+			p[0] = pq_to_linear( pix.red / 255.0 );
+			p[1] = pq_to_linear( pix.green / 255.0 );
+			p[2] = pq_to_linear( pix.blue / 255.0 );
 		}
 		
 	uhdr_enc_set_quality(encoder, 97, UHDR_BASE_IMG);
@@ -178,6 +188,8 @@ int main(int argc, char * argv[])
 		if (exif_result.error_code != UHDR_CODEC_OK)
 			std::cout << exif_result.detail;
 	}
+	
+	uhdr_enc_set_using_multi_channel_gainmap(encoder, 0);
 	
 	std::cout << "Start encode\n";
 	auto encode_result = uhdr_encode(encoder);
